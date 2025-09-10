@@ -259,24 +259,24 @@ col1, col2, col3 = st.columns(3)
 with col1:
     if st.button("🧭 Product Manager"):
         st.session_state.starter_msg = pm_prompt
-        st.experimental_rerun()
+        st.rerun()
     if st.button("🧪 Delivery Lead"):
         st.session_state.starter_msg = delivery_prompt
-        st.experimental_rerun()
+        st.rerun()
 with col2:
     if st.button("🛠️ CTO"):
         st.session_state.starter_msg = cto_prompt
-        st.experimental_rerun()
+        st.rerun()
     if st.button("🧩 Exec Sponsor"):
         st.session_state.starter_msg = exec_prompt
-        st.experimental_rerun()
+        st.rerun()
 with col3:
     if st.button("💰 CFO"):
         st.session_state.starter_msg = cfo_prompt
-        st.experimental_rerun()
+        st.rerun()
     if st.button("📞 Support Ops"):
         st.session_state.starter_msg = support_prompt
-        st.experimental_rerun()
+        st.rerun()
 
 # ---------------------------
 # Render history
