@@ -229,44 +229,54 @@ def history_plain() -> str:
 
 
 # ---------------------------
-# Sidebar demo controls (adjust demo assumptions safely)
+# Persona starter prompts (TechCo roles)
 # ---------------------------
-with st.sidebar:
-    st.header("Demo Controls")
+st.subheader("Try one of these to start the conversation")
 
-    seats = st.number_input("Seats", min_value=10, max_value=5000, value=CATALOG["demo_customer"]["seats"], step=10)
-    rate = st.number_input("Hourly blended rate ($)", min_value=10.0, max_value=500.0, value=CATALOG["demo_customer"]["hourly_blended_rate"], step=5.0)
-    on_time_baseline = st.slider("Baseline on‑time rate", 0.3, 0.95, float(CATALOG["demo_customer"]["current_kpis"]["on_time_rate"]))
+pm_prompt = (
+    "Help me keep ProjectEase simple — what's the minimum predictive feature set for v1 "
+    "we can ship in 6 months under a $500k budget?"
+)
+cto_prompt = (
+    "Explain how you predict late tasks using lightweight, explainable signals only. "
+    "What data do you need from ProjectEase, and how would we keep ops minimal?"
+)
+cfo_prompt = (
+    "Price this for 250 seats and estimate monthly savings, net benefit, and payback in months."
+)
+delivery_prompt = (
+    "We keep hitting blockers in design reviews. How would Risk Radar help next sprint? "
+    "Show the top drivers you’d surface."
+)
+exec_prompt = (
+    "Give me a 3‑bullet weekly summary for our Q4 release and the top risks with simple actions."
+)
+support_prompt = (
+    "Summarize action items from these comments: [paste comments here]."
+)
 
-    if st.button("Apply demo changes"):
-        CATALOG["demo_customer"]["seats"] = int(seats)
-        CATALOG["demo_customer"]["hourly_blended_rate"] = float(rate)
-        CATALOG["demo_customer"]["current_kpis"]["on_time_rate"] = float(on_time_baseline)
-        st.toast("Demo parameters updated.")
-
-    def preload_scripted():
-        scripted = [
-            ("user", "We keep discovering late tasks too late. Can you help us predict slips?"),
-            ("assistant", "Predictive Scheduling flags likely delays early and suggests next actions. It’s lightweight and explainable inside ProjectEase."),
-            ("user", "What does it cost for ~100 seats and what’s the ROI?"),
-            ("assistant", "Price is per user per month from the JSON. I’ll show price, savings, and payback using the demo assumptions."),
-            ("user", "We also want risk visibility for leadership."),
-            ("assistant", "Adding Risk Radar gives risk scores and a daily digest. Want to see a bundle with Smart Summaries too?"),
-            ("user", "Yes, show the bundle."),
-            ("assistant", "Bundling all three applies a 15% discount. I’ll calculate cost, savings, and on‑time uplift.")
-        ]
-        st.session_state.chat = model.start_chat(history=[])
-        st.session_state.display_history = scripted
-
-    if st.button("Load scripted demo"):
-        preload_scripted()
+col1, col2, col3 = st.columns(3)
+with col1:
+    if st.button("🧭 Product Manager"):
+        st.session_state.starter_msg = pm_prompt
         st.experimental_rerun()
-
-    if st.button("Reset chat"):
-        st.session_state.chat = model.start_chat(history=[])
-        st.session_state.display_history = []
+    if st.button("🧪 Delivery Lead"):
+        st.session_state.starter_msg = delivery_prompt
         st.experimental_rerun()
-
+with col2:
+    if st.button("🛠️ CTO"):
+        st.session_state.starter_msg = cto_prompt
+        st.experimental_rerun()
+    if st.button("🧩 Exec Sponsor"):
+        st.session_state.starter_msg = exec_prompt
+        st.experimental_rerun()
+with col3:
+    if st.button("💰 CFO"):
+        st.session_state.starter_msg = cfo_prompt
+        st.experimental_rerun()
+    if st.button("📞 Support Ops"):
+        st.session_state.starter_msg = support_prompt
+        st.experimental_rerun()
 
 # ---------------------------
 # Render history
@@ -279,7 +289,8 @@ for role, text in st.session_state.display_history:
 # ---------------------------
 # Chat input
 # ---------------------------
-user_msg = st.chat_input("Ask about features, pricing, or ROI…")
+starter = st.session_state.pop("starter_msg", None)
+user_msg = starter or st.chat_input("Ask about features, pricing, or ROI…")
 if user_msg:
     st.session_state.display_history.append(("user", user_msg))
     with st.chat_message("user"):
