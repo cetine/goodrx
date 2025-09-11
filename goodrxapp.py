@@ -1,25 +1,34 @@
+import os
 import json
 from typing import List, Dict, Any
 
 import streamlit as st
 import google.generativeai as genai
+from streamlit_mic_recorder import mic_recorder
 
 # ---------------------------
-# API Key (⚠️ hard-coded — don’t commit this!)
+# Config & API key
 # ---------------------------
-API_KEY = "AIzaSyAikRV-gvDqSHDJY05GiL7x7GEITgK7FwI"
+st.set_page_config(page_title="GoodRx Demo – Gemini Flash (Voice + Text)", page_icon="💛", layout="centered")
+
+# Prefer secrets; uncomment the next line to hard-code (NOT recommended on GitHub/Cloud)
+# API_KEY = "YOUR_HARDCODED_KEY_HERE"
+API_KEY = os.getenv("GOOGLE_API_KEY")
+
+if not API_KEY:
+    st.error("No GOOGLE_API_KEY found. Set it in Streamlit Cloud Secrets or your environment.")
+    st.stop()
+
 genai.configure(api_key=API_KEY)
 
 # ---------------------------
-# Streamlit page setup
+# Page header
 # ---------------------------
-st.set_page_config(page_title="GoodRx Demo – Gemini Flash", page_icon="💛", layout="centered")
-
-st.markdown("# 💛 GoodRx – AI Subscription Coach (Gemini Flash)")
-st.caption("Demo only. Not medical advice. Don’t enter PHI/PII.")
+st.markdown("# 💛 GoodRx – AI Subscription Coach")
+st.caption("Talk or type. Demo only. Not medical advice. Don’t enter PHI/PII.")
 
 # ---------------------------
-# Demo catalog & pricing rules
+# Deterministic catalog & pricing
 # ---------------------------
 CATALOG = {
     "plans": {
@@ -47,13 +56,15 @@ CATALOG = {
     },
     "demo_patient": {
         "current_spend": {
-            "Metformin": 42.0,
+            "Metformin": 42.0,        # USD/month
             "ACE_inhibitor": 20.0
         }
     }
 }
 
 def bundle_price(plan_names: List[str]) -> float:
+    if not plan_names:
+        return 0.0
     base = sum(CATALOG["plans"][p]["monthly_price"] for p in plan_names)
     discount_pct = 0.0
     if len(plan_names) >= 2:
@@ -66,9 +77,11 @@ def savings_vs_current(selected_plans: List[str], current_spend_map: Dict[str, f
         current += current_spend_map.get("Metformin", 0.0)
     if "Heart Health" in selected_plans:
         current += current_spend_map.get("ACE_inhibitor", 0.0)
+
     new_monthly = bundle_price(selected_plans)
     monthly_savings = round(max(current - new_monthly, 0.0), 2)
     annual_savings = round(monthly_savings * 12, 2)
+
     return {
         "current_monthly": round(current, 2),
         "new_monthly": new_monthly,
@@ -78,32 +91,48 @@ def savings_vs_current(selected_plans: List[str], current_spend_map: Dict[str, f
 
 def infer_dynamic_context(user_text: str, history_text: str) -> Dict[str, Any]:
     text = (user_text + " " + history_text).lower()
+
     want_diabetes = ("diabetes" in text) or ("metformin" in text)
-    want_heart = ("blood pressure" in text) or ("bp " in text) or ("ace" in text) or ("heart" in text)
+    want_heart = ("blood pressure" in text) or (" bp " in text) or ("ace" in text) or ("heart" in text)
+
     selected = []
     if want_diabetes:
         selected.append("Diabetes Care")
     if want_heart:
         selected.append("Heart Health")
+
     ctx = {"selected_plans": selected, "quotes": {}}
+
     if selected:
-        ctx["quotes"]["selected_plans_quote"] = savings_vs_current(selected, CATALOG["demo_patient"]["current_spend"])
-    if "bundle" in text or "both" in text or ("together" in text):
+        q = savings_vs_current(selected, CATALOG["demo_patient"]["current_spend"])
+        ctx["quotes"]["selected_plans_quote"] = q
+
+    # Bundle intent
+    if "bundle" in text or "both" in text or "together" in text:
         both = ["Diabetes Care", "Heart Health"]
-        ctx["quotes"]["bundle_quote"] = savings_vs_current(both, CATALOG["demo_patient"]["current_spend"])
+        q2 = savings_vs_current(both, CATALOG["demo_patient"]["current_spend"])
+        ctx["quotes"]["bundle_quote"] = q2
         ctx["quotes"]["bundle_plans"] = both
+
     return ctx
 
 # ---------------------------
-# Gemini setup (Flash model only)
+# Gemini 1.5 Flash (direct)
 # ---------------------------
 SYSTEM_PROMPT = """You are an AI subscription coach for a GoodRx-style experience.
+
 GOALS:
-1) Explain available medication subscription plans and bundles.
-2) Use ONLY the provided JSON data for all numbers—never invent prices.
+1) Help users understand relevant medication subscription plans and bundles.
+2) Use ONLY the provided catalog and computed quotes for all numbers—do not invent prices.
 3) Be concise, friendly, and proactive. Offer bundles when relevant.
-4) If costs are asked: show current spend → new subscription price → monthly & annual savings.
-5) Safety: You are not a clinician. Do not give medical advice or treatment recommendations.
+4) When costs are asked: show current spend → new subscription price → monthly and annual savings.
+5) Safety: You are not a clinician. Do not provide medical advice, diagnosis, or treatment.
+
+RULES:
+- Prices must come from the injected Catalog/Context JSON.
+- If something isn’t in the data, say you don’t know.
+- If Diabetes and Heart are both relevant, offer a two-plan bundle at 10% off combined price.
+- Keep the tone practical and helpful.
 """
 
 model = genai.GenerativeModel(
@@ -112,22 +141,22 @@ model = genai.GenerativeModel(
 )
 
 # ---------------------------
-# Chat state
+# Session state
 # ---------------------------
 if "chat" not in st.session_state:
     st.session_state.chat = model.start_chat(history=[])
 if "display_history" not in st.session_state:
-    st.session_state.display_history = []  # (role, text)
+    st.session_state.display_history = []  # list[(role, text)]
 
-def history_plain() -> str:
+def history_plain_text() -> str:
     return "\n".join(f"{r}: {t}" for r, t in st.session_state.display_history)
 
 # ---------------------------
-# Sidebar demo controls
+# Sidebar: helpers
 # ---------------------------
 st.sidebar.header("Demo Controls")
 
-def preload_scripted():
+def preload_script():
     scripted = [
         ("user", "I need help managing my diabetes medications."),
         ("assistant", "I see you regularly refill Metformin. Many people in your situation save with our Diabetes Care Subscription; it includes Metformin refills, glucose monitor strips, and a telehealth check-in every 3 months."),
@@ -142,11 +171,19 @@ def preload_scripted():
     st.session_state.display_history = scripted
 
 if st.sidebar.button("Load scripted demo"):
-    preload_scripted()
+    preload_script()
     st.rerun()
+
 if st.sidebar.button("Reset chat"):
     st.session_state.chat = model.start_chat(history=[])
     st.session_state.display_history = []
+
+st.sidebar.markdown("---")
+st.sidebar.write("**Pricing (demo):**")
+st.sidebar.write("- Diabetes Care: $29/mo")
+st.sidebar.write("- Heart Health: $25/mo")
+st.sidebar.write("- Bundle (2 plans): 10% off combined")
+st.sidebar.write("- Demo current spend: Metformin $42/mo, ACE inhibitor $20/mo")
 
 # ---------------------------
 # Render history
@@ -156,24 +193,73 @@ for role, text in st.session_state.display_history:
         st.markdown(text)
 
 # ---------------------------
-# Chat input
+# Voice input (🎤)
 # ---------------------------
+st.subheader("🎤 Talk to the assistant")
+st.caption("Click to record, then click again to stop. Your audio is sent to Gemini for transcription + reply.")
+
+audio = mic_recorder(
+    start_prompt="🎤 Start recording",
+    stop_prompt="⬛ Stop",
+    just_once=False,
+    key="mic",
+    format="wav"
+)
+
+if audio:
+    # The component returns a dict with "bytes" (audio data as bytes)
+    audio_bytes = audio.get("bytes")
+    if audio_bytes:
+        st.audio(audio_bytes, format="audio/wav")
+
+        # Build deterministic context for this turn
+        dynamic_ctx = infer_dynamic_context("", history_plain_text())
+
+        # Compose the text part that instructs Gemini to use the JSON for numbers
+        text_payload = (
+            "You will answer using ONLY the following JSON data for prices and quotes.\n\n"
+            "CATALOG_JSON:\n" + json.dumps(CATALOG, indent=2) + "\n\n"
+            "CONTEXT_JSON:\n" + json.dumps(dynamic_ctx, indent=2) + "\n\n"
+            "AUDIO_MESSAGE follows (user spoke). Transcribe and answer."
+        )
+
+        try:
+            # Send as multimodal: text + audio
+            response = st.session_state.chat.send_message(
+                [
+                    text_payload,
+                    {"mime_type": "audio/wav", "data": audio_bytes},
+                ]
+            )
+            ai_text = response.text or "(No response)"
+        except Exception as e:
+            ai_text = f"Error calling Gemini with audio: {e}"
+
+        st.session_state.display_history.append(("assistant", ai_text))
+        with st.chat_message("assistant"):
+            st.markdown(ai_text)
+
+# ---------------------------
+# Text input (⌨️)
+# ---------------------------
+st.subheader("💬 Or type a message")
 user_msg = st.chat_input("Type your message…")
+
 if user_msg:
     st.session_state.display_history.append(("user", user_msg))
     with st.chat_message("user"):
         st.markdown(user_msg)
 
-    ctx = infer_dynamic_context(user_msg, history_plain())
-    payload = (
+    dynamic_ctx = infer_dynamic_context(user_msg, history_plain_text())
+    text_payload = (
         "Use ONLY the following JSON data for pricing:\n\n"
         "CATALOG_JSON:\n" + json.dumps(CATALOG, indent=2) +
-        "\n\nCONTEXT_JSON:\n" + json.dumps(ctx, indent=2) +
+        "\n\nCONTEXT_JSON:\n" + json.dumps(dynamic_ctx, indent=2) +
         "\n\nUSER_MESSAGE:\n" + user_msg
     )
 
     try:
-        response = st.session_state.chat.send_message(payload)
+        response = st.session_state.chat.send_message(text_payload)
         ai_text = response.text or "(No response)"
     except Exception as e:
         ai_text = f"Error calling Gemini: {e}"
@@ -186,7 +272,7 @@ if user_msg:
 # Footer
 # ---------------------------
 st.markdown(
-    "<br><small>⚠️ Prototype demo only. Not medical advice. "
+    "<br><small>⚠️ Prototype for demonstration only and not medical advice. "
     "Consult a licensed clinician for personal medical questions.</small>",
     unsafe_allow_html=True
 )
