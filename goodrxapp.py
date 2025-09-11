@@ -1,35 +1,38 @@
 import os
+import io
 import json
 from typing import List, Dict, Any
 
 import streamlit as st
 import google.generativeai as genai
 from streamlit_mic_recorder import mic_recorder
+from gtts import gTTS
 
-# ---------------------------
+# =========================
 # Config & API key
-# ---------------------------
-st.set_page_config(page_title="GoodRx Demo – Gemini Flash (Voice + Text)", page_icon="💛", layout="centered")
+# =========================
+st.set_page_config(page_title="GoodRx Demos — Chat + Voice", page_icon="💛", layout="centered")
 
-# Prefer secrets; uncomment the next line to hard-code (NOT recommended on GitHub/Cloud)
-# API_KEY = "YOUR_HARDCODED_KEY_HERE"
+# Prefer secrets; uncomment to hard-code (NOT recommended on GitHub/Cloud)
+# API_KEY = "PASTE_YOUR_KEY_HERE"
 API_KEY = os.getenv("GOOGLE_API_KEY")
 
 if not API_KEY:
-    st.error("No GOOGLE_API_KEY found. Set it in Streamlit Cloud Secrets or your environment.")
+    st.error("No GOOGLE_API_KEY found. Add it in Streamlit Cloud Secrets or set it in your environment.")
     st.stop()
 
 genai.configure(api_key=API_KEY)
 
-# ---------------------------
-# Page header
-# ---------------------------
-st.markdown("# 💛 GoodRx – AI Subscription Coach")
-st.caption("Talk or type. Demo only. Not medical advice. Don’t enter PHI/PII.")
+# Always use Gemini 1.5 Flash
+def make_model(system_prompt: str):
+    return genai.GenerativeModel(
+        model_name="gemini-1.5-flash",
+        system_instruction=system_prompt,
+    )
 
-# ---------------------------
-# Deterministic catalog & pricing
-# ---------------------------
+# =========================
+# Deterministic catalog & pricing (Chat demo)
+# =========================
 CATALOG = {
     "plans": {
         "Diabetes Care": {
@@ -51,12 +54,10 @@ CATALOG = {
             "description": "Subscription for blood pressure management."
         }
     },
-    "bundle_rules": {
-        "any_two_plans_discount_pct": 10.0
-    },
+    "bundle_rules": {"any_two_plans_discount_pct": 10.0},
     "demo_patient": {
         "current_spend": {
-            "Metformin": 42.0,        # USD/month
+            "Metformin": 42.0,       # USD/month
             "ACE_inhibitor": 20.0
         }
     }
@@ -77,11 +78,9 @@ def savings_vs_current(selected_plans: List[str], current_spend_map: Dict[str, f
         current += current_spend_map.get("Metformin", 0.0)
     if "Heart Health" in selected_plans:
         current += current_spend_map.get("ACE_inhibitor", 0.0)
-
     new_monthly = bundle_price(selected_plans)
     monthly_savings = round(max(current - new_monthly, 0.0), 2)
     annual_savings = round(monthly_savings * 12, 2)
-
     return {
         "current_monthly": round(current, 2),
         "new_monthly": new_monthly,
@@ -91,188 +90,251 @@ def savings_vs_current(selected_plans: List[str], current_spend_map: Dict[str, f
 
 def infer_dynamic_context(user_text: str, history_text: str) -> Dict[str, Any]:
     text = (user_text + " " + history_text).lower()
-
     want_diabetes = ("diabetes" in text) or ("metformin" in text)
     want_heart = ("blood pressure" in text) or (" bp " in text) or ("ace" in text) or ("heart" in text)
-
     selected = []
     if want_diabetes:
         selected.append("Diabetes Care")
     if want_heart:
         selected.append("Heart Health")
-
     ctx = {"selected_plans": selected, "quotes": {}}
-
     if selected:
-        q = savings_vs_current(selected, CATALOG["demo_patient"]["current_spend"])
-        ctx["quotes"]["selected_plans_quote"] = q
-
-    # Bundle intent
+        ctx["quotes"]["selected_plans_quote"] = savings_vs_current(selected, CATALOG["demo_patient"]["current_spend"])
     if "bundle" in text or "both" in text or "together" in text:
         both = ["Diabetes Care", "Heart Health"]
-        q2 = savings_vs_current(both, CATALOG["demo_patient"]["current_spend"])
-        ctx["quotes"]["bundle_quote"] = q2
+        ctx["quotes"]["bundle_quote"] = savings_vs_current(both, CATALOG["demo_patient"]["current_spend"])
         ctx["quotes"]["bundle_plans"] = both
-
     return ctx
 
-# ---------------------------
-# Gemini 1.5 Flash (direct)
-# ---------------------------
-SYSTEM_PROMPT = """You are an AI subscription coach for a GoodRx-style experience.
+def history_to_text(display_history):
+    return "\n".join(f"{r}: {t}" for r, t in display_history)
+
+# =========================
+# Prompts
+# =========================
+CHAT_SYSTEM_PROMPT = """You are an AI subscription coach for a GoodRx-style experience.
 
 GOALS:
-1) Help users understand relevant medication subscription plans and bundles.
-2) Use ONLY the provided catalog and computed quotes for all numbers—do not invent prices.
+1) Explain available medication subscription plans and bundles.
+2) Use ONLY the provided JSON (catalog + precomputed quotes) for all numbers — never invent prices.
 3) Be concise, friendly, and proactive. Offer bundles when relevant.
-4) When costs are asked: show current spend → new subscription price → monthly and annual savings.
-5) Safety: You are not a clinician. Do not provide medical advice, diagnosis, or treatment.
+4) If costs are asked: show current spend → new subscription price → monthly & annual savings.
+5) You are not a clinician. Do not give medical advice or treatment recommendations.
 
-RULES:
-- Prices must come from the injected Catalog/Context JSON.
-- If something isn’t in the data, say you don’t know.
-- If Diabetes and Heart are both relevant, offer a two-plan bundle at 10% off combined price.
-- Keep the tone practical and helpful.
+OUTPUT:
+- Short, clear, helpful replies grounded in the injected JSON.
 """
 
-model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
-    system_instruction=SYSTEM_PROMPT,
-)
+VOICE_SYSTEM_PROMPT = """You are the GoodRx Senior Voice Bot.
+Follow this flow strictly unless the user asks to speak to a person:
+1) Greeting + ID verification: ask for full name, date of birth, and phone number on file.
+2) Offer help menu (user can say things naturally):
+   1. Find the best price for my medicine
+   2. Pharmacy didn’t accept my card
+   3. Billing or membership
+   4. App or account help
+   5. Refills or deliveries
+   6. GoodRx Care (telehealth) help
+   7. General questions
+   Or the user can say “Talk to a person.”
+3) Branch handling:
+   - Price Finder: ask medication name, strength, quantity, then present the lowest price and offer to text a coupon or read card numbers.
+   - Pharmacy didn’t accept card: ask which pharmacy + medication; offer to text correct codes or connect to an agent.
+   - Billing/Membership: explain Gold; offer keep/cancel/billing question; transfer to billing if cancel.
+   - App/Account: e.g., forgot password → offer SMS reset link to phone on file.
+   - Delivery/Refill: ask medication; give shipping status (simulate) + offer to text tracking link.
+   - GoodRx Care: ask appointment date; connect to care support.
+   - General questions: provide brief info.
+4) Escalation: if user asks to “talk to a person,” confirm and say you’re connecting them.
 
-# ---------------------------
-# Session state
-# ---------------------------
-if "chat" not in st.session_state:
-    st.session_state.chat = model.start_chat(history=[])
-if "display_history" not in st.session_state:
-    st.session_state.display_history = []  # list[(role, text)]
+STYLE:
+- Speak in short, friendly sentences optimized for audio.
+- Confirm back critical details (name, DOB, last 4 of phone) before moving on.
+- If you "text" or "connect" to someone, just state it as a confirmation (simulation).
 
-def history_plain_text() -> str:
-    return "\n".join(f"{r}: {t}" for r, t in st.session_state.display_history)
+IMPORTANT:
+- Do not ask for or store PHI beyond what’s in this simulated flow.
+- If the user asks for medical advice, politely decline and suggest contacting a clinician.
+"""
 
-# ---------------------------
-# Sidebar: helpers
-# ---------------------------
-st.sidebar.header("Demo Controls")
+# =========================
+# UI Tabs
+# =========================
+st.title("💛 GoodRx Demos")
+tab_chat, tab_voice = st.tabs(["💬 Chat — Subscription Coach", "🎧 Voice — Senior Support Bot"])
 
-def preload_script():
-    scripted = [
-        ("user", "I need help managing my diabetes medications."),
-        ("assistant", "I see you regularly refill Metformin. Many people in your situation save with our Diabetes Care Subscription; it includes Metformin refills, glucose monitor strips, and a telehealth check-in every 3 months."),
-        ("user", "How much would that cost me?"),
-        ("assistant", "You currently spend about $42/month. With the subscription, your cost drops to $29/month, and you get the telehealth consult included. Over a year, that’s about $156 saved."),
-        ("user", "Is there a similar plan for blood pressure?"),
-        ("assistant", "Yes. Our Heart Health Plan covers ACE inhibitors, a digital BP monitor, and priority refills for $25/month. Would you like to see both bundled together at a discounted rate?"),
-        ("user", "Yes, show me."),
-        ("assistant", "Bundling Diabetes Care + Heart Health together saves an additional 10%, bringing your total monthly cost to $49. This bundle has been popular with people managing multiple conditions.")
-    ]
-    st.session_state.chat = model.start_chat(history=[])
-    st.session_state.display_history = scripted
+# =========================
+# TAB 1 — Chat demo
+# =========================
+with tab_chat:
+    st.write("Ask about diabetes or blood pressure plans, prices, and bundles. Numbers are deterministic from the demo catalog.")
+    # Sidebar-like cheat sheet
+    st.markdown("> **Pricing (demo):** Diabetes Care $29/mo • Heart Health $25/mo • Bundle = 10% off combined\n\n"
+                "> **Demo current spend:** Metformin $42/mo • ACE inhibitor $20/mo")
 
-if st.sidebar.button("Load scripted demo"):
-    preload_script()
-    st.rerun()
+    if "chat_model" not in st.session_state:
+        st.session_state.chat_model = make_model(CHAT_SYSTEM_PROMPT)
+    if "chat_session" not in st.session_state:
+        st.session_state.chat_session = st.session_state.chat_model.start_chat(history=[])
+    if "chat_display" not in st.session_state:
+        st.session_state.chat_display = []
 
-if st.sidebar.button("Reset chat"):
-    st.session_state.chat = model.start_chat(history=[])
-    st.session_state.display_history = []
+    # Render history
+    for role, text in st.session_state.chat_display:
+        with st.chat_message("user" if role == "user" else "assistant"):
+            st.markdown(text)
 
-st.sidebar.markdown("---")
-st.sidebar.write("**Pricing (demo):**")
-st.sidebar.write("- Diabetes Care: $29/mo")
-st.sidebar.write("- Heart Health: $25/mo")
-st.sidebar.write("- Bundle (2 plans): 10% off combined")
-st.sidebar.write("- Demo current spend: Metformin $42/mo, ACE inhibitor $20/mo")
+    # Scripted conversation loader
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Load scripted demo"):
+            scripted = [
+                ("user", "I need help managing my diabetes medications."),
+                ("assistant", "I see you regularly refill Metformin. Many people in your situation save with our Diabetes Care Subscription; it includes Metformin refills, glucose monitor strips, and a telehealth check-in every 3 months."),
+                ("user", "How much would that cost me?"),
+                ("assistant", "You currently spend about $42/month. With the subscription, your cost drops to $29/month, and you get the telehealth consult included. Over a year, that’s about $156 saved."),
+                ("user", "Is there a similar plan for blood pressure?"),
+                ("assistant", "Yes. Our Heart Health Plan covers ACE inhibitors, a digital BP monitor, and priority refills for $25/month. Would you like to see both bundled together at a discounted rate?"),
+                ("user", "Yes, show me."),
+                ("assistant", "Bundling Diabetes Care + Heart Health together saves an additional 10%, bringing your total monthly cost to $49. This bundle has been popular with people managing multiple conditions.")
+            ]
+            st.session_state.chat_session = st.session_state.chat_model.start_chat(history=[])
+            st.session_state.chat_display = scripted
+            st.rerun()
+    with col2:
+        if st.button("Reset chat"):
+            st.session_state.chat_session = st.session_state.chat_model.start_chat(history=[])
+            st.session_state.chat_display = []
+            st.rerun()
 
-# ---------------------------
-# Render history
-# ---------------------------
-for role, text in st.session_state.display_history:
-    with st.chat_message("user" if role == "user" else "assistant"):
-        st.markdown(text)
+    # Chat input
+    chat_user = st.chat_input("Type your message…")
+    if chat_user:
+        st.session_state.chat_display.append(("user", chat_user))
+        with st.chat_message("user"):
+            st.markdown(chat_user)
 
-# ---------------------------
-# Voice input (🎤)
-# ---------------------------
-st.subheader("🎤 Talk to the assistant")
-st.caption("Click to record, then click again to stop. Your audio is sent to Gemini for transcription + reply.")
-
-audio = mic_recorder(
-    start_prompt="🎤 Start recording",
-    stop_prompt="⬛ Stop",
-    just_once=False,
-    key="mic",
-    format="wav"
-)
-
-if audio:
-    # The component returns a dict with "bytes" (audio data as bytes)
-    audio_bytes = audio.get("bytes")
-    if audio_bytes:
-        st.audio(audio_bytes, format="audio/wav")
-
-        # Build deterministic context for this turn
-        dynamic_ctx = infer_dynamic_context("", history_plain_text())
-
-        # Compose the text part that instructs Gemini to use the JSON for numbers
-        text_payload = (
-            "You will answer using ONLY the following JSON data for prices and quotes.\n\n"
-            "CATALOG_JSON:\n" + json.dumps(CATALOG, indent=2) + "\n\n"
-            "CONTEXT_JSON:\n" + json.dumps(dynamic_ctx, indent=2) + "\n\n"
-            "AUDIO_MESSAGE follows (user spoke). Transcribe and answer."
+        dynamic_ctx = infer_dynamic_context(chat_user, history_to_text(st.session_state.chat_display))
+        payload = (
+            "Use ONLY the following JSON data for pricing:\n\n"
+            "CATALOG_JSON:\n" + json.dumps(CATALOG, indent=2) +
+            "\n\nCONTEXT_JSON:\n" + json.dumps(dynamic_ctx, indent=2) +
+            "\n\nUSER_MESSAGE:\n" + chat_user
         )
 
         try:
-            # Send as multimodal: text + audio
-            response = st.session_state.chat.send_message(
-                [
-                    text_payload,
-                    {"mime_type": "audio/wav", "data": audio_bytes},
-                ]
-            )
-            ai_text = response.text or "(No response)"
+            resp = st.session_state.chat_session.send_message(payload)
+            ai_text = resp.text or "(No response)"
         except Exception as e:
-            ai_text = f"Error calling Gemini with audio: {e}"
+            ai_text = f"Error calling Gemini: {e}"
 
-        st.session_state.display_history.append(("assistant", ai_text))
+        st.session_state.chat_display.append(("assistant", ai_text))
         with st.chat_message("assistant"):
             st.markdown(ai_text)
 
-# ---------------------------
-# Text input (⌨️)
-# ---------------------------
-st.subheader("💬 Or type a message")
-user_msg = st.chat_input("Type your message…")
+    st.caption("⚠️ Demo only. Not medical advice.")
 
-if user_msg:
-    st.session_state.display_history.append(("user", user_msg))
-    with st.chat_message("user"):
-        st.markdown(user_msg)
+# =========================
+# TAB 2 — Voice demo (talks back)
+# =========================
+with tab_voice:
+    st.write("Speak to the Senior Voice Bot. It will verify identity, present a menu, branch to common tasks, and **talk back**.")
+    if "voice_model" not in st.session_state:
+        st.session_state.voice_model = make_model(VOICE_SYSTEM_PROMPT)
+    if "voice_session" not in st.session_state:
+        st.session_state.voice_session = st.session_state.voice_model.start_chat(history=[])
+    if "voice_display" not in st.session_state:
+        st.session_state.voice_display = []  # (role, text)
 
-    dynamic_ctx = infer_dynamic_context(user_msg, history_plain_text())
-    text_payload = (
-        "Use ONLY the following JSON data for pricing:\n\n"
-        "CATALOG_JSON:\n" + json.dumps(CATALOG, indent=2) +
-        "\n\nCONTEXT_JSON:\n" + json.dumps(dynamic_ctx, indent=2) +
-        "\n\nUSER_MESSAGE:\n" + user_msg
+    # Controls
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Start over (Voice)"):
+            st.session_state.voice_session = st.session_state.voice_model.start_chat(history=[])
+            st.session_state.voice_display = []
+            st.rerun()
+    with col2:
+        st.info("Say anything like: ‘Hi’, ‘Find the best price’, ‘Pharmacy didn’t accept my card’, ‘I forgot my password’, ‘Talk to a person’…")
+
+    # Render history
+    for role, text in st.session_state.voice_display:
+        with st.chat_message("user" if role == "user" else "assistant"):
+            st.markdown(text)
+
+    # --- Voice input ---
+    st.subheader("🎤 Talk")
+    st.caption("Click to record, then click again to stop. Your audio is sent to Gemini for transcription + reply.")
+    audio = mic_recorder(
+        start_prompt="🎤 Start recording",
+        stop_prompt="⬛ Stop",
+        key="mic_voice",
+        format="wav",
+        just_once=False,
     )
 
-    try:
-        response = st.session_state.chat.send_message(text_payload)
-        ai_text = response.text or "(No response)"
-    except Exception as e:
-        ai_text = f"Error calling Gemini: {e}"
+    if audio:
+        audio_bytes = audio.get("bytes")
+        if audio_bytes:
+            st.audio(audio_bytes, format="audio/wav")
 
-    st.session_state.display_history.append(("assistant", ai_text))
-    with st.chat_message("assistant"):
-        st.markdown(ai_text)
+            # Provide a compact reminder of allowed actions/flow so Gemini stays on script
+            guidance = (
+                "System reminder: Follow the Senior Voice Bot flow (verify identity, then present the 7-option menu, "
+                "then branch accordingly; allow escalation). Keep replies short for audio. If you text or connect, "
+                "state it as a confirmation (simulation)."
+            )
 
-# ---------------------------
-# Footer
-# ---------------------------
-st.markdown(
-    "<br><small>⚠️ Prototype for demonstration only and not medical advice. "
-    "Consult a licensed clinician for personal medical questions.</small>",
-    unsafe_allow_html=True
-)
+            try:
+                resp = st.session_state.voice_session.send_message(
+                    [
+                        guidance,
+                        {"mime_type": "audio/wav", "data": audio_bytes},
+                    ]
+                )
+                ai_text = resp.text or "(No response)"
+            except Exception as e:
+                ai_text = f"Error calling Gemini with audio: {e}"
+
+            st.session_state.voice_display.append(("assistant", ai_text))
+            with st.chat_message("assistant"):
+                st.markdown(ai_text)
+
+            # TTS — speak the bot's reply
+            try:
+                tts = gTTS(text=ai_text, lang="en")
+                buf = io.BytesIO()
+                tts.write_to_fp(buf)
+                buf.seek(0)
+                st.audio(buf, format="audio/mp3")
+            except Exception as e:
+                st.warning(f"TTS error: {e}")
+
+    # --- Text input fallback (voice tab) ---
+    st.subheader("💬 Or type")
+    voice_text = st.chat_input("Type here if you prefer…")
+    if voice_text:
+        st.session_state.voice_display.append(("user", voice_text))
+        with st.chat_message("user"):
+            st.markdown(voice_text)
+
+        try:
+            resp = st.session_state.voice_session.send_message(voice_text)
+            ai_text = resp.text or "(No response)"
+        except Exception as e:
+            ai_text = f"Error calling Gemini: {e}"
+
+        st.session_state.voice_display.append(("assistant", ai_text))
+        with st.chat_message("assistant"):
+            st.markdown(ai_text)
+
+        # TTS again
+        try:
+            tts = gTTS(text=ai_text, lang="en")
+            buf = io.BytesIO()
+            tts.write_to_fp(buf)
+            buf.seek(0)
+            st.audio(buf, format="audio/mp3")
+        except Exception as e:
+            st.warning(f"TTS error: {e}")
+
+    st.caption("☎️ This is a simulation. We don’t actually place calls or send SMS; we just confirm actions for the demo.")
